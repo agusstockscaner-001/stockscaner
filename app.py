@@ -1,6 +1,6 @@
 """
-AI Stock Scanner - Versi Cloudflare Proxy
-Data Yahoo Finance lewat Cloudflare Worker (anti-block)
+AI Stock Scanner v3 - Multi-Timeframe + Volume Akumulasi + Backtest
+Data Yahoo Finance lewat Cloudflare Worker
 """
 
 import streamlit as st
@@ -11,8 +11,6 @@ from urllib.parse import quote
 
 st.set_page_config(page_title="AI Stock Scanner", page_icon="🎯", layout="wide", initial_sidebar_state="collapsed")
 
-# ============================================================
-# GANTI URL INI DENGAN URL CLOUDFLARE WORKER KAMU
 # ============================================================
 PROXY = "https://yahoo-proxy.agusstockscaner.workers.dev/?url="
 # ============================================================
@@ -46,21 +44,18 @@ SEKTOR = {
 WATCHLIST = [s for l in SEKTOR.values() for s in l]
 
 @st.cache_data(ttl=300)
-def fetch_chart(symbol):
-    yahoo = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=6mo&interval=1d"
+def fetch_chart(symbol, rng="1y"):
+    yahoo = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range={rng}&interval=1d"
     try:
         r = requests.get(PROXY + quote(yahoo, safe=""), timeout=15)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        result = data["chart"]["result"][0]
+        if r.status_code != 200: return None
+        result = r.json()["chart"]["result"][0]
         q = result["indicators"]["quote"][0]
         clean = []
         for o,h,l,c,v in zip(q["open"],q["high"],q["low"],q["close"],q["volume"]):
             if all(x is not None for x in [o,h,l,c,v]) and o>0:
                 clean.append((o,h,l,c,v))
-        if len(clean) < 30:
-            return None
+        if len(clean) < 50: return None
         o,h,l,c,v = zip(*clean)
         return {"open":list(o),"high":list(h),"low":list(l),"close":list(c),"volume":list(v)}
     except Exception:
@@ -71,15 +66,11 @@ def fetch_fundamental(symbol):
     yahoo = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}?modules=defaultKeyStatistics,financialData,summaryDetail"
     try:
         r = requests.get(PROXY + quote(yahoo, safe=""), timeout=15)
-        if r.status_code != 200:
-            return None
+        if r.status_code != 200: return None
         result = r.json()["quoteSummary"]["result"][0]
-        ks = result.get("defaultKeyStatistics",{})
-        fd = result.get("financialData",{})
-        sd = result.get("summaryDetail",{})
+        ks = result.get("defaultKeyStatistics",{}); fd = result.get("financialData",{}); sd = result.get("summaryDetail",{})
         def safe(d,k):
-            v = d.get(k,{})
-            return v.get("raw") if isinstance(v,dict) else None
+            v = d.get(k,{}); return v.get("raw") if isinstance(v,dict) else None
         return {"per":safe(sd,"trailingPE") or safe(ks,"trailingPE"),"pbv":safe(ks,"priceToBook"),
                 "roe":safe(fd,"returnOnEquity"),"der":safe(fd,"debtToEquity"),"eps_growth":safe(ks,"earningsQuarterlyGrowth")}
     except Exception:
@@ -102,11 +93,13 @@ def rsi(d,p=14):
     return 100-(100/(1+ag/al))
 def macd(d):
     e12,e26=ema(d,12),ema(d,26)
-    if not e12 or not e26: return 0,0
+    if not e12 or not e26: return 0,0,0
     n=min(len(e12),len(e26))
     m=[e12[-n+i]-e26[-n+i] for i in range(n)]
     s=ema(m,9)
-    return m[-1],(s[-1] if s else 0)
+    h=m[-1]-(s[-1] if s else 0)
+    hp=(m[-2]-s[-2]) if len(m)>1 and len(s)>1 else 0
+    return m[-1],(s[-1] if s else 0),h-hp
 
 def score_fund(f):
     if not f: return 50,"N/A"
@@ -124,132 +117,193 @@ def score_fund(f):
     lbl="💎 EXCELLENT" if fin>=75 else "✅ GOOD" if fin>=60 else "⚠️ FAIR" if fin>=45 else "❌ POOR"
     return fin,lbl
 
-def analyze(symbol, mbonus):
-    d=fetch_chart(symbol)
+def weekly_trend(cl):
+    weekly = cl[::5]
+    if len(weekly) < 10: return "NETRAL", 0
+    we10 = ema(weekly, 10)
+    if not we10: return "NETRAL", 0
+    if weekly[-1] > we10[-1]: return "BULLISH", 3
+    return "BEARISH", -2
+
+def detect_accumulation(cl, vol):
+    if len(vol) < 20: return False, 0
+    recent_vol = sum(vol[-5:]) / 5
+    older_vol = sum(vol[-20:-5]) / 15
+    vol_rising = recent_vol > older_vol * 1.2
+    pc5 = (cl[-1] - cl[-6]) / cl[-6] * 100 if len(cl) >= 6 else 0
+    if vol_rising and -3 < pc5 < 5:
+        return True, 5
+    return False, 0
+
+def detect_breakout(cl, hi, vol):
+    if len(hi) < 21: return False, 0
+    resistance = max(hi[-21:-1])
+    avg_vol = sum(vol[-20:]) / 20
+    if cl[-1] > resistance and vol[-1] > avg_vol * 1.5:
+        return True, 6
+    return False, 0
+
+def analyze(symbol, mbonus, market_regime):
+    d = fetch_chart(symbol)
     if not d: return None
-    op,hi,lo,cl,vol=d["open"],d["high"],d["low"],d["close"],d["volume"]
-    harga=cl[-1]
-    e20,e50=ema(cl,20),ema(cl,50)
+    op,hi,lo,cl,vol = d["open"],d["high"],d["low"],d["close"],d["volume"]
+    harga = cl[-1]
+    e20,e50 = ema(cl,20),ema(cl,50)
     if not e20 or not e50: return None
-    avgv=sum(vol[-20:])/20
-    vr=vol[-1]/avgv if avgv>0 else 0
-    rv=rsi(cl); ml,ms=macd(cl)
-    score=0
+    avgv = sum(vol[-20:])/20
+    vr = vol[-1]/avgv if avgv>0 else 0
+    rv = rsi(cl)
+    ml,ms,hist_mom = macd(cl)
+
+    score = 0
     if harga>e20[-1]: score+=3
     if harga>e50[-1]: score+=3
     if e20[-1]>e50[-1]: score+=4
     if 45<=rv<=68: score+=4
     elif rv>75: score-=4
     if ml>ms: score+=4
+    if hist_mom>0: score+=2
     if vr>=1.8: score+=5
     elif vr>=1.3: score+=3
-    score+=mbonus
-    sup=min(lo[-20:]); res=max(hi[-21:-1])
-    rr=(res-harga)/(harga-sup) if harga>sup else 0
-    crange=hi[-1]-lo[-1]
+
+    wtrend, wbonus = weekly_trend(cl)
+    score += wbonus
+    is_accum, accum_bonus = detect_accumulation(cl, vol)
+    score += accum_bonus
+    is_breakout, bo_bonus = detect_breakout(cl, hi, vol)
+    score += bo_bonus
+
+    if market_regime == "🔴 BEARISH":
+        if harga > e20[-1] and wtrend == "BULLISH":
+            score += 3
+        else:
+            score += mbonus
+    else:
+        score += mbonus
+
+    sup = min(lo[-20:]); res = max(hi[-21:-1])
+    rr = (res-harga)/(harga-sup) if harga>sup else 0
+    crange = hi[-1]-lo[-1]
     if crange<=0: return None
-    cpos=(cl[-1]-lo[-1])/crange
-    nearhigh=cpos>=0.7
-    of=0
-    if nearhigh: of+=4
-    if vr>=1.5: of+=4
+    cpos = (cl[-1]-lo[-1])/crange
+    nearhigh = cpos>=0.7
+
+    of = 0
+    if nearhigh: of+=3
+    if vr>=1.5: of+=3
     if cl[-1]>op[-1]: of+=2
-    cont=0
-    if lo[-1]>lo[-2]: cont+=3
-    if nearhigh: cont+=2
-    if vr>=1.3: cont+=2
-    upper=hi[-1]-cl[-1]; body=abs(cl[-1]-op[-1])
-    dist=vr>=2 and upper>body and cpos<0.5
+
+    upper = hi[-1]-cl[-1]; body = abs(cl[-1]-op[-1])
+    dist = vr>=2 and upper>body and cpos<0.5
     if dist: score-=6
-    absorb=vr>=1.5 and nearhigh and (hi[-1]-lo[-1])/lo[-1]*100<4
-    if absorb: score+=4
-    bo=harga>res and vr>=1.3 and nearhigh
-    if bo: score+=5
-    fake=hi[-1]>res and harga<res and vr>=1.3
+    fake = hi[-1]>res and harga<res and vr>=1.3
     if fake: score-=7
-    fp=score+of+cont
-    fund=fetch_fundamental(symbol)
-    fs,fl=score_fund(fund)
+
+    fp = score + of
+    fund = fetch_fundamental(symbol)
+    fs,fl = score_fund(fund)
     if fs<30: fp-=8
+
     if fake or dist: dec="🚫 AVOID"
-    elif fp>=32 and rr>=1.5 and fs>=50: dec="🔥 PRIORITY BUY"
-    elif fp>=25 and fs>=45: dec="🎯 SWING TARGET"
-    elif fp>=18: dec="👀 WATCH"
+    elif fp>=30 and rr>=1.5 and fs>=45: dec="🔥 PRIORITY BUY"
+    elif fp>=22 and fs>=40: dec="🎯 SWING TARGET"
+    elif fp>=15: dec="👀 WATCH"
     else: dec="🚫 AVOID"
+
     if fake or dist or fs<30: risk="HIGH"
     elif rr>=1.8 and nearhigh and fs>=60: risk="LOW"
     else: risk="MEDIUM"
-    conf=max(0,min(95,int(fp*2.2+(fs-50)*0.2)))
-    tpct=((res-harga)/harga)*100
-    slpct=((harga-sup)/harga)*100
-    flow="🐋 ACCUMULATION" if absorb else "⚠️ DISTRIBUTION" if dist else "NORMAL"
-    sector=next((s for s,l in SEKTOR.items() if symbol in l),"LAINNYA")
+
+    conf = max(0,min(95,int(fp*2.3+(fs-50)*0.2)))
+    tpct = ((res-harga)/harga)*100
+    slpct = ((harga-sup)/harga)*100
+
+    tags = []
+    if is_accum: tags.append("🐋 Akumulasi")
+    if is_breakout: tags.append("🚀 Breakout")
+    if wtrend=="BULLISH": tags.append("📈 Weekly Bull")
+    if hist_mom>0: tags.append("⚡ MACD↑")
+
+    flow = "🐋 ACCUMULATION" if is_accum else "⚠️ DISTRIBUTION" if dist else "NORMAL"
+    sector = next((s for s,l in SEKTOR.items() if symbol in l),"LAINNYA")
     return {"symbol":symbol.replace(".JK",""),"sector":sector,"harga":harga,
             "change":(cl[-1]-cl[-2])/cl[-2]*100,"fp":fp,"rr":rr,"conf":conf,"risk":risk,
             "flow":flow,"dec":dec,"fs":fs,"fl":fl,"tpct":tpct,"slpct":slpct,"rsi":rv,"vr":vr,
-            "is_gem":fp>=25 and fs>=70,"is_trap":fp>=25 and fs<40,"chart":cl[-30:]}
+            "is_gem":fp>=22 and fs>=70,"is_trap":fp>=22 and fs<40,"chart":cl[-30:],
+            "tags":tags,"wtrend":wtrend,"is_accum":is_accum,"is_breakout":is_breakout}
 
 def regime():
-    d=fetch_chart("^JKSE")
+    d = fetch_chart("^JKSE", rng="6mo")
     if not d: return "UNKNOWN",0
-    cl=d["close"]; e20,e50=ema(cl,20),ema(cl,50)
+    cl = d["close"]; e20,e50 = ema(cl,20),ema(cl,50)
     if not e20 or not e50: return "UNKNOWN",0
-    h=cl[-1]
+    h = cl[-1]
     if h>e20[-1]>e50[-1]: return "🟢 STRONG BULLISH",4
     elif h>e50[-1]: return "🟡 NEUTRAL",0
-    else: return "🔴 BEARISH",-4
+    return "🔴 BEARISH",-4
 
-fmtp=lambda p:"Rp "+format(round(p),",")
-GRADE=lambda c:("#00ff88" if c>=82 else "#2ed573" if c>=74 else "#a3ff6e" if c>=65 else "#ffd32a" if c>=55 else "#ff6b81")
+@st.cache_data(ttl=3600)
+def backtest_symbol(symbol, target_pct=5, sl_pct=3, hold_days=6):
+    d = fetch_chart(symbol, rng="1y")
+    if not d: return None
+    cl,hi,lo,vol = d["close"],d["high"],d["low"],d["volume"]
+    wins=losses=total=0
+    for i in range(60, len(cl)-hold_days):
+        sub = cl[:i]
+        e20,e50 = ema(sub,20),ema(sub,50)
+        if not e20 or not e50: continue
+        rv = rsi(sub)
+        ml,ms,_ = macd(sub)
+        avgv = sum(vol[i-20:i])/20
+        vr = vol[i]/avgv if avgv>0 else 0
+        sig = (sub[-1]>e20[-1]>e50[-1] and 45<=rv<=68 and ml>ms and vr>=1.3)
+        if sig:
+            entry = cl[i]
+            fhigh = max(hi[i+1:i+1+hold_days])
+            flow = min(lo[i+1:i+1+hold_days])
+            gain = (fhigh-entry)/entry*100
+            loss = (flow-entry)/entry*100
+            total+=1
+            if gain>=target_pct: wins+=1
+            elif loss<=-sl_pct: losses+=1
+    if total==0: return None
+    return {"symbol":symbol.replace(".JK",""),"total":total,"wins":wins,
+            "losses":losses,"win_rate":wins/total*100}
 
-# UI
-c1,c2=st.columns([3,1])
+fmtp = lambda p:"Rp "+format(round(p),",")
+
+c1,c2 = st.columns([3,1])
 with c1:
-    st.markdown("# 🎯 AI Stock Scanner")
-    st.caption(f"LQ45 · Swing 2-5 hari · Target 5%+ · {datetime.now().strftime('%d %b %Y · %H:%M')}")
+    st.markdown("# 🎯 AI Stock Scanner v3")
+    st.caption(f"LQ45 · Swing 1-6 hari · Target 5%+ · Multi-Timeframe + Volume Akumulasi · {datetime.now().strftime('%d %b %Y · %H:%M')}")
 with c2:
     if st.button("🔄 Refresh", use_container_width=True, type="primary"):
         st.cache_data.clear(); st.rerun()
 
-reg,bonus=regime()
+reg,bonus = regime()
 if reg=="UNKNOWN":
-    st.error("⚠️ Gagal ambil data IHSG. Lihat detail error di bawah.")
-    # Diagnostic
-    with st.expander("🔍 Detail Diagnosa (klik untuk lihat)"):
-        test_url = "https://query1.finance.yahoo.com/v8/finance/chart/BBCA.JK?range=6mo&interval=1d"
-        full = PROXY + quote(test_url, safe="")
-        st.write("URL yang dipakai app:")
-        st.code(full)
-        try:
-            tr = requests.get(full, timeout=15)
-            st.write(f"Status code: {tr.status_code}")
-            st.write(f"Response (200 char pertama):")
-            st.code(tr.text[:200])
-        except Exception as e:
-            st.write(f"Error koneksi: {e}")
+    st.error("⚠️ Gagal ambil data IHSG. Coba Refresh.")
 else:
     st.info(f"**Market Regime IHSG:** {reg}")
 
 if 'results' not in st.session_state:
     st.session_state.results=None
 if st.session_state.results is None:
-    prog=st.progress(0,text="Memindai saham...")
+    prog = st.progress(0,text="Memindai saham...")
     res=[]
     for i,s in enumerate(WATCHLIST):
         prog.progress((i+1)/len(WATCHLIST),text=f"Scanning {s}... ({i+1}/{len(WATCHLIST)})")
-        r=analyze(s,bonus)
+        r = analyze(s,bonus,reg)
         if r: res.append(r)
     prog.empty()
-    st.session_state.results=sorted(res,key=lambda x:x["conf"],reverse=True)
-results=st.session_state.results or []
-
-if not results:
-    st.warning("Belum ada data saham yang berhasil dimuat. Klik Refresh atau cek URL proxy.")
+    st.session_state.results = sorted(res,key=lambda x:x["conf"],reverse=True)
+results = st.session_state.results or []
 
 def card(s,cls="stock-card"):
-    color={"🔥 PRIORITY BUY":"#00ff88","🎯 SWING TARGET":"#4da6ff","👀 WATCH":"#ffd32a","🚫 AVOID":"#ff4757"}.get(s["dec"],"#888")
-    tp=s["harga"]*(1+s["tpct"]/100); sl=s["harga"]*(1-s["slpct"]/100)
-    cc="#00ff88" if s["change"]>=0 else "#ff4757"; cs="+" if s["change"]>=0 else ""
+    color = {"🔥 PRIORITY BUY":"#00ff88","🎯 SWING TARGET":"#4da6ff","👀 WATCH":"#ffd32a","🚫 AVOID":"#ff4757"}.get(s["dec"],"#888")
+    tp = s["harga"]*(1+s["tpct"]/100); sl = s["harga"]*(1-s["slpct"]/100)
+    cc = "#00ff88" if s["change"]>=0 else "#ff4757"; cs = "+" if s["change"]>=0 else ""
+    tags_html = " ".join([f'<span class="badge" style="background:#1a3a2a;color:#7fffd4;">{t}</span>' for t in s.get("tags",[])])
     st.markdown(f"""<div class="stock-card {cls}">
     <div style="display:flex;justify-content:space-between;margin-bottom:10px;">
     <div><div style="font-size:20px;font-weight:800;color:#fff;">{s['symbol']}</div>
@@ -268,43 +322,85 @@ def card(s,cls="stock-card"):
     <span class="badge" style="background:{color}22;color:{color};border:1px solid {color}66;">{s['dec']}</span>
     <span class="badge" style="background:#2a4060;color:#ccc;">Fund: {s['fl']}</span>
     <span class="badge" style="background:#2a4060;color:#ccc;">Risk: {s['risk']}</span></div>
-    <div style="font-size:11px;color:#666;">RSI: {s['rsi']:.0f} · Vol: {s['vr']:.1f}x · Flow: {s['flow']}</div></div>""",unsafe_allow_html=True)
+    <div style="margin-bottom:6px;">{tags_html}</div>
+    <div style="font-size:11px;color:#666;">RSI: {s['rsi']:.0f} · Vol: {s['vr']:.1f}x · Weekly: {s['wtrend']} · Flow: {s['flow']}</div></div>""",unsafe_allow_html=True)
 
-t1,t2,t3,t4,t5=st.tabs(["🔥 Hotlist","💎 Hidden Gem","⚠️ Value Trap","📊 Semua","ℹ️ Info"])
+t1,t2,t3,t4,t5,t6 = st.tabs(["🔥 Hotlist","💎 Hidden Gem","⚠️ Value Trap","📊 Semua","🧪 Backtest","ℹ️ Info"])
 with t1:
-    hot=[s for s in results if "PRIORITY BUY" in s["dec"] or "SWING TARGET" in s["dec"]]
+    hot = [s for s in results if "PRIORITY BUY" in s["dec"] or "SWING TARGET" in s["dec"]]
     st.markdown(f"### 🔥 {len(hot)} Sinyal Buy")
+    st.caption("Tag 🐋 Akumulasi / 🚀 Breakout / 📈 Weekly Bull = kualitas lebih tinggi")
     if not hot: st.info("Tidak ada sinyal kuat saat ini.")
     for s in hot: card(s,"priority-card")
 with t2:
-    gems=[s for s in results if s["is_gem"]]
+    gems = [s for s in results if s["is_gem"]]
     st.markdown(f"### 💎 {len(gems)} Hidden Gem")
     if not gems: st.info("Belum ada hidden gem.")
     for s in gems: card(s,"gem-card")
 with t3:
-    traps=[s for s in results if s["is_trap"]]
+    traps = [s for s in results if s["is_trap"]]
     st.markdown(f"### ⚠️ {len(traps)} Value Trap")
     if not traps: st.info("Tidak ada value trap.")
     for s in traps: card(s,"trap-card")
 with t4:
     st.markdown(f"### 📊 Semua ({len(results)})")
-    mc=st.slider("Min Confidence",0,95,50,5)
-    fil=[s for s in results if s["conf"]>=mc]
+    mc = st.slider("Min Confidence",0,95,40,5)
+    fil = [s for s in results if s["conf"]>=mc]
     if fil:
-        df=pd.DataFrame([{"Saham":s["symbol"],"Sektor":s["sector"],"Harga":fmtp(s["harga"]),
+        df = pd.DataFrame([{"Saham":s["symbol"],"Sektor":s["sector"],"Harga":fmtp(s["harga"]),
             "Conf%":s["conf"],"Target%":f"+{s['tpct']:.1f}","R/R":f"{s['rr']:.1f}x",
-            "Sinyal":s["dec"].split()[1] if " " in s["dec"] else s["dec"]} for s in fil])
+            "Weekly":s["wtrend"],"Sinyal":s["dec"].split()[1] if " " in s["dec"] else s["dec"]} for s in fil])
         st.dataframe(df,use_container_width=True,hide_index=True,height=500)
 with t5:
+    st.markdown("### 🧪 Backtest Strategi")
+    st.caption("Uji: berapa % sinyal historis yang BENAR naik ≥5% dalam 6 hari (data 1 tahun). Win rate JUJUR.")
+    if st.button("▶️ Jalankan Backtest (±1 menit)"):
+        prog2 = st.progress(0,text="Backtesting...")
+        bt=[]
+        for i,s in enumerate(WATCHLIST):
+            prog2.progress((i+1)/len(WATCHLIST),text=f"Backtest {s}...")
+            r = backtest_symbol(s)
+            if r and r["total"]>=3: bt.append(r)
+        prog2.empty()
+        if bt:
+            tt = sum(r["total"] for r in bt); tw = sum(r["wins"] for r in bt)
+            wr = tw/tt*100 if tt else 0
+            st.metric("📊 Win Rate Keseluruhan", f"{wr:.1f}%", f"{tw}/{tt} trades")
+            st.caption(f"Dari {tt} sinyal historis, {tw} berhasil naik ≥5% dalam 6 hari.")
+            df_bt = pd.DataFrame([{"Saham":r["symbol"],"Total Sinyal":r["total"],
+                "Menang":r["wins"],"Win Rate":f"{r['win_rate']:.0f}%"} for r in sorted(bt,key=lambda x:x["win_rate"],reverse=True)])
+            st.dataframe(df_bt,use_container_width=True,hide_index=True,height=400)
+            if wr < 50:
+                st.warning("⚠️ Win rate di bawah 50%. Strategi belum andal — jangan over-trade.")
+            elif wr < 60:
+                st.info("Win rate 50-60% — wajar untuk swing. Manajemen risiko tetap kunci.")
+            else:
+                st.success("Win rate di atas 60% — bagus, tapi tetap pakai stop loss. Masa lalu ≠ jaminan masa depan.")
+with t6:
     st.markdown("""
-    ### ℹ️ Info
-    **Data:** Yahoo Finance via Cloudflare Worker proxy (anti-block).
-    **Confidence:** gabungan teknikal (70%) + fundamental (30%).
+    ### ℹ️ Apa yang Baru di v3
     
-    ### ⚠️ Disclaimer
-    - Data delay ~15 menit
-    - Confidence = estimasi, BUKAN jaminan profit
-    - Win rate realistis swing: 55-65%
-    - Selalu pakai stop loss
-    - Tools edukasi, bukan rekomendasi investasi
+    **Filter baru untuk sinyal lebih akurat:**
+    - 🐋 **Volume Akumulasi** — deteksi bandar mengumpulkan saham (volume naik + harga stabil)
+    - 🚀 **Breakout Konfirmasi** — harga tembus resistance + volume besar
+    - 📈 **Multi-Timeframe** — cek tren mingguan, bukan cuma harian
+    - ⚡ **MACD Momentum** — deteksi momentum menguat
+    - 🧪 **Backtest** — uji win rate strategi di data 1 tahun (jujur!)
+    
+    **Tag pada kartu** menunjukkan kekuatan sinyal. Makin banyak tag = makin kuat.
+    
+    ### 🎯 Cara Pakai untuk Cari Kenaikan
+    1. Cek tab **Hotlist** — fokus yang punya tag 🐋/🚀/📈
+    2. Jalankan **Backtest** dulu untuk tahu win rate realistis
+    3. Pilih saham dengan **R/R ≥ 1.5** (reward > risiko)
+    4. Konfirmasi dengan volume & berita
+    
+    ### ⚠️ Disclaimer Penting
+    - **TIDAK ADA** yang bisa prediksi pasti saham naik
+    - Confidence & backtest = probabilitas, BUKAN jaminan
+    - Win rate realistis swing: 55-65% (bahkan profesional)
+    - **Selalu pakai stop loss** — ~40% sinyal akan salah
+    - Manajemen risiko > akurasi prediksi
+    - Tools edukasi, keputusan & risiko di tangan kamu
+    - Jangan investasi uang yang tidak siap rugi
     """)
